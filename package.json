@@ -1,0 +1,34 @@
+{
+  "name": "mansa-african-markets-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing African stock market data from NGX Pulse and Mansa Markets",
+  "main": "server.js",
+  "type": "module",
+  "bin": {
+    "mansa-african-markets-mcp": "./server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "mcp",
+    "africa",
+    "stock-market",
+    "ngx",
+    "nigeria",
+    "mansa-markets",
+    "claude"
+  ],
+  "author": "Mansa Markets",
+  "license": "MIT",
+  "dependencies": {
+    "@hono/node-server": "^1.19.12",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "express": "^5.2.1",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
