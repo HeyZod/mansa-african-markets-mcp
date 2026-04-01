@@ -3,14 +3,26 @@
   "name": "io.github.heyzod/mansa-african-markets",
   "description": "Live African stock data: NGX, GSE, NSE, JSE, BRVM. 773+ stocks, prices, indices and movers.",
   "repository": {
-    "url": "https://github.com/HeyZod/mansa-african-markets-mcp",
+    "url": "https://github.com/heyzod/mansa-african-markets-mcp",
     "source": "github"
   },
   "homepage": "https://mansamarkets.com",
   "version": "1.0.0",
   "license": "MIT",
-  "categories": ["finance", "data", "africa"],
-  "tags": ["stocks", "african-markets", "ngx", "jse", "gse", "nse", "finance"],
+  "categories": [
+    "finance",
+    "data",
+    "africa"
+  ],
+  "tags": [
+    "stocks",
+    "african-markets",
+    "ngx",
+    "jse",
+    "gse",
+    "nse",
+    "finance"
+  ],
   "packages": [
     {
       "registryType": "http",
