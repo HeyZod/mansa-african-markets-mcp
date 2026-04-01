@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.heyzod/mansa-african-markets",
-  "description": "Live African stock market data across 13 exchanges. 773+ stocks, real-time prices, indices, top movers. NGX, GSE, NSE, JSE, BRVM and more.",
+  "description": "Live African stock data: NGX, GSE, NSE, JSE, BRVM. 773+ stocks, prices, indices and movers.",
   "repository": {
     "url": "https://github.com/HeyZod/mansa-african-markets-mcp",
     "source": "github"
