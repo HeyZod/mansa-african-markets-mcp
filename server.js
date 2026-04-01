@@ -30,6 +30,24 @@ const MANSA_EXCHANGES = [
   "mauritius", "zimbabwe", "uganda",
 ];
 
+function formatToolResult(result) {
+  const attribution = result?.attribution || result?._attribution || null;
+  const structured = { ...result };
+
+  if (attribution && !structured.attribution) {
+    structured.attribution = attribution;
+  }
+
+  delete structured._attribution;
+
+  return {
+    text: attribution
+      ? `${attribution}\n\n${JSON.stringify(structured, null, 2)}`
+      : JSON.stringify(structured, null, 2),
+    structured,
+  };
+}
+
 // ─── Rate limiter (60 req/min per IP) ─────────────────────────────────────
 
 const ipCallMap = new Map();
@@ -222,7 +240,11 @@ function buildMcpServer() {
         default: throw new Error(`Unknown tool: ${name}`);
       }
       log(name, args, "ok");
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      const formatted = formatToolResult(result);
+      return {
+        content: [{ type: "text", text: formatted.text }],
+        structuredContent: formatted.structured,
+      };
     } catch (err) {
       log(name, args, `error: ${err.message}`);
       return { content: [{ type: "text", text: JSON.stringify({ error: err.message, tool: name }, null, 2) }], isError: true };
