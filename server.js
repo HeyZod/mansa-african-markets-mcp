@@ -6,6 +6,8 @@
  */
 
 import express from "express";
+import fs from "node:fs";
+import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -23,6 +25,10 @@ const NGX_API_KEY = process.env.NGX_API_KEY || "ngxpulse_c6maakeuc936ai8r";
 const MANSA_API_KEY = process.env.MANSA_API_KEY || "mansa_live_sk_wwvqfer8gumty7an";
 const NGX_ATTRIBUTION = "Data powered by NGX Pulse (ngxpulse.ng)";
 const MANSA_ATTRIBUTION = "Data powered by Mansa Markets (mansamarkets.com)";
+const RUNTIME_DIR = process.env.MCP_RUNTIME_DIR || path.join(process.cwd(), "runtime");
+const STATS_FILE = process.env.MCP_STATS_FILE || path.join(RUNTIME_DIR, "mcp-stats.json");
+const MAX_RECENT_CALLS = parseInt(process.env.MCP_MAX_RECENT_CALLS || "5000", 10);
+const MAX_EVENT_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 const MANSA_EXCHANGES = [
   "nigeria", "ghana", "kenya", "south-africa", "ivory-coast",
@@ -35,6 +41,144 @@ const TOOL_ANNOTATIONS = {
   openWorldHint: true,
   idempotentHint: true,
 };
+
+function ensureRuntimeDir() {
+  if (!fs.existsSync(RUNTIME_DIR)) {
+    fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+  }
+}
+
+function defaultStatsStore() {
+  return {
+    startedAt: new Date().toISOString(),
+    totals: {
+      allTime: 0,
+      success: 0,
+      error: 0,
+    },
+    recentCalls: [],
+  };
+}
+
+function loadStatsStore() {
+  try {
+    ensureRuntimeDir();
+    if (!fs.existsSync(STATS_FILE)) {
+      return defaultStatsStore();
+    }
+
+    const parsed = JSON.parse(fs.readFileSync(STATS_FILE, "utf8"));
+    return {
+      ...defaultStatsStore(),
+      ...parsed,
+      recentCalls: Array.isArray(parsed?.recentCalls) ? parsed.recentCalls : [],
+      totals: {
+        ...defaultStatsStore().totals,
+        ...(parsed?.totals || {}),
+      },
+    };
+  } catch {
+    return defaultStatsStore();
+  }
+}
+
+function saveStatsStore() {
+  try {
+    ensureRuntimeDir();
+    fs.writeFileSync(STATS_FILE, JSON.stringify(statsStore, null, 2));
+  } catch (error) {
+    process.stderr.write(`[mansa-mcp] failed to persist stats: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+}
+
+function pruneRecentCalls() {
+  const cutoff = Date.now() - MAX_EVENT_AGE_MS;
+  statsStore.recentCalls = (statsStore.recentCalls || [])
+    .filter((call) => new Date(call.occurredAt).getTime() >= cutoff)
+    .slice(-MAX_RECENT_CALLS);
+}
+
+function normalizeClient(userAgent = "") {
+  const value = userAgent.toLowerCase();
+  if (!value) return "Other";
+  if (value.includes("claude") || value.includes("anthropic")) return "Claude";
+  if (value.includes("cursor")) return "Cursor";
+  if (value.includes("windsurf")) return "Windsurf";
+  if (value.includes("chatgpt") || value.includes("openai")) return "ChatGPT";
+  return "Other";
+}
+
+function groupCounts(values) {
+  const counts = new Map();
+  for (const value of values) {
+    counts.set(value, (counts.get(value) || 0) + 1);
+  }
+
+  return Array.from(counts.entries())
+    .map(([label, value]) => ({ label, value }))
+    .sort((a, b) => b.value - a.value);
+}
+
+function recordToolCall(event) {
+  statsStore.totals.allTime += 1;
+  if (event.status === "error") {
+    statsStore.totals.error += 1;
+  } else {
+    statsStore.totals.success += 1;
+  }
+
+  statsStore.recentCalls.push(event);
+  pruneRecentCalls();
+  saveStatsStore();
+}
+
+function getStatsPayload() {
+  pruneRecentCalls();
+
+  const now = Date.now();
+  const todayThreshold = new Date();
+  todayThreshold.setHours(0, 0, 0, 0);
+  const weekThreshold = now - 7 * 24 * 60 * 60 * 1000;
+  const todayCalls = statsStore.recentCalls.filter((call) => new Date(call.occurredAt).getTime() >= todayThreshold.getTime());
+  const weekCalls = statsStore.recentCalls.filter((call) => new Date(call.occurredAt).getTime() >= weekThreshold);
+  const successfulCalls = statsStore.recentCalls.filter((call) => call.status !== "error");
+
+  const hourlyMap = new Map();
+  for (const call of todayCalls) {
+    const label = new Date(call.occurredAt).toISOString().slice(11, 13) + ":00";
+    hourlyMap.set(label, (hourlyMap.get(label) || 0) + 1);
+  }
+
+  const dailyMap = new Map();
+  for (const call of weekCalls) {
+    const label = new Date(call.occurredAt).toISOString().slice(5, 10);
+    dailyMap.set(label, (dailyMap.get(label) || 0) + 1);
+  }
+
+  return {
+    configured: true,
+    stats: {
+      today: todayCalls.length,
+      week: weekCalls.length,
+      allTime: statsStore.totals.allTime,
+      avgResponseTimeMs: successfulCalls.length
+        ? successfulCalls.reduce((sum, call) => sum + (call.responseTimeMs || 0), 0) / successfulCalls.length
+        : null,
+      errorRate: statsStore.totals.allTime
+        ? (statsStore.totals.error / statsStore.totals.allTime) * 100
+        : null,
+    },
+    toolCalls: groupCounts(statsStore.recentCalls.map((call) => call.tool)).slice(0, 10),
+    hourlyTrend: Array.from(hourlyMap.entries()).map(([label, value]) => ({ label, value })),
+    dailyTrend: Array.from(dailyMap.entries()).map(([label, value]) => ({ label, value })),
+    geography: groupCounts(statsStore.recentCalls.map((call) => call.country || "Unknown")).slice(0, 10),
+    userAgents: groupCounts(statsStore.recentCalls.map((call) => call.client || "Other")).slice(0, 10),
+    recentCalls: statsStore.recentCalls.slice(-20).reverse(),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+const statsStore = loadStatsStore();
 
 function formatToolResult(result) {
   const attribution = result?.attribution || result?._attribution || null;
@@ -74,6 +218,19 @@ function log(tool, params, status) {
   process.stdout.write(
     `[${new Date().toISOString()}] tool=${tool} params=${JSON.stringify(params)} status=${status}\n`
   );
+}
+
+function getRequestCountry(req) {
+  return (
+    req.headers["cf-ipcountry"] ||
+    req.headers["x-vercel-ip-country"] ||
+    req.headers["x-country-code"] ||
+    "Unknown"
+  );
+}
+
+function getRequestUserAgent(req) {
+  return req.headers["user-agent"] || "Unknown";
 }
 
 // ─── HTTP helpers ──────────────────────────────────────────────────────────
@@ -218,7 +375,7 @@ const TOOLS = [
 
 // ─── MCP server factory ────────────────────────────────────────────────────
 
-function buildMcpServer() {
+function buildMcpServer(requestMeta = {}) {
   const server = new Server({ name: "mansa-african-markets-mcp", version: "1.0.0" }, { capabilities: { tools: {} } });
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -226,6 +383,7 @@ function buildMcpServer() {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
     log(name, args, "start");
+    const startedAt = Date.now();
     try {
       let result;
       switch (name) {
@@ -246,6 +404,17 @@ function buildMcpServer() {
         default: throw new Error(`Unknown tool: ${name}`);
       }
       log(name, args, "ok");
+      recordToolCall({
+        id: `${name}-${Date.now()}`,
+        tool: name,
+        params: JSON.stringify(args),
+        occurredAt: new Date().toISOString(),
+        country: requestMeta.country || "Unknown",
+        userAgent: requestMeta.userAgent || "Unknown",
+        client: requestMeta.client || "Other",
+        status: "ok",
+        responseTimeMs: Date.now() - startedAt,
+      });
       const formatted = formatToolResult(result);
       return {
         content: [{ type: "text", text: formatted.text }],
@@ -253,6 +422,17 @@ function buildMcpServer() {
       };
     } catch (err) {
       log(name, args, `error: ${err.message}`);
+      recordToolCall({
+        id: `${name}-${Date.now()}`,
+        tool: name,
+        params: JSON.stringify(args),
+        occurredAt: new Date().toISOString(),
+        country: requestMeta.country || "Unknown",
+        userAgent: requestMeta.userAgent || "Unknown",
+        client: requestMeta.client || "Other",
+        status: "error",
+        responseTimeMs: Date.now() - startedAt,
+      });
       return { content: [{ type: "text", text: JSON.stringify({ error: err.message, tool: name }, null, 2) }], isError: true };
     }
   });
@@ -269,12 +449,21 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok", server: "mansa-african-markets-mcp", version: "1.0.0", tools: TOOLS.length });
 });
 
+app.get("/stats", (_req, res) => {
+  res.json(getStatsPayload());
+});
+
 app.post("/mcp", async (req, res) => {
   const ip = req.headers["x-forwarded-for"] || req.socket.remoteAddress || "unknown";
   try { checkRateLimit(String(ip)); } catch (err) { return res.status(429).json({ error: err.message }); }
 
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-  const server = buildMcpServer();
+  const userAgent = getRequestUserAgent(req);
+  const server = buildMcpServer({
+    country: getRequestCountry(req),
+    userAgent,
+    client: normalizeClient(String(userAgent)),
+  });
   res.on("close", () => transport.close());
 
   try {
