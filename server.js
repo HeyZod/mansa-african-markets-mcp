@@ -10,6 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createClient } from "@supabase/supabase-js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -29,6 +30,8 @@ const RUNTIME_DIR = process.env.MCP_RUNTIME_DIR || path.join(process.cwd(), "run
 const STATS_FILE = process.env.MCP_STATS_FILE || path.join(RUNTIME_DIR, "mcp-stats.json");
 const MAX_RECENT_CALLS = parseInt(process.env.MCP_MAX_RECENT_CALLS || "5000", 10);
 const MAX_EVENT_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || null;
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || null;
 
 const MANSA_EXCHANGES = [
   "nigeria", "ghana", "kenya", "south-africa", "ivory-coast",
@@ -41,6 +44,7 @@ const TOOL_ANNOTATIONS = {
   openWorldHint: true,
   idempotentHint: true,
 };
+let supabaseClient = null;
 
 function ensureRuntimeDir() {
   if (!fs.existsSync(RUNTIME_DIR)) {
@@ -58,6 +62,24 @@ function defaultStatsStore() {
     },
     recentCalls: [],
   };
+}
+
+function hasSupabaseConfig() {
+  return Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY);
+}
+
+function getSupabaseClient() {
+  if (!hasSupabaseConfig()) {
+    return null;
+  }
+
+  if (!supabaseClient) {
+    supabaseClient = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+  }
+
+  return supabaseClient;
 }
 
 function loadStatsStore() {
@@ -119,7 +141,30 @@ function groupCounts(values) {
     .sort((a, b) => b.value - a.value);
 }
 
-function recordToolCall(event) {
+async function persistToolCallToSupabase(event) {
+  const client = getSupabaseClient();
+  if (!client) return false;
+
+  const { error } = await client.from("mcp_call_logs").insert({
+    tool_name: event.tool,
+    params: event.params ? JSON.parse(event.params) : {},
+    country: event.country,
+    user_agent: event.userAgent,
+    client: event.client,
+    status: event.status,
+    response_time_ms: event.responseTimeMs,
+    created_at: event.occurredAt,
+  });
+
+  if (error) {
+    process.stderr.write(`[mansa-mcp] failed to write Supabase log: ${error.message}\n`);
+    return false;
+  }
+
+  return true;
+}
+
+async function recordToolCall(event) {
   statsStore.totals.allTime += 1;
   if (event.status === "error") {
     statsStore.totals.error += 1;
@@ -130,9 +175,101 @@ function recordToolCall(event) {
   statsStore.recentCalls.push(event);
   pruneRecentCalls();
   saveStatsStore();
+  await persistToolCallToSupabase(event);
 }
 
-function getStatsPayload() {
+async function getSupabaseStatsPayload() {
+  const client = getSupabaseClient();
+  if (!client) return null;
+
+  const now = Date.now();
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayIso = today.toISOString();
+  const weekIso = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const monthIso = new Date(now - MAX_EVENT_AGE_MS).toISOString();
+
+  const [
+    allTimeCountRes,
+    todayCountRes,
+    weekCountRes,
+    errorCountRes,
+    recentRowsRes,
+  ] = await Promise.all([
+    client.from("mcp_call_logs").select("*", { count: "exact", head: true }),
+    client.from("mcp_call_logs").select("*", { count: "exact", head: true }).gte("created_at", todayIso),
+    client.from("mcp_call_logs").select("*", { count: "exact", head: true }).gte("created_at", weekIso),
+    client.from("mcp_call_logs").select("*", { count: "exact", head: true }).eq("status", "error"),
+    client
+      .from("mcp_call_logs")
+      .select("id, tool_name, params, country, user_agent, client, status, response_time_ms, created_at")
+      .gte("created_at", monthIso)
+      .order("created_at", { ascending: false })
+      .limit(MAX_RECENT_CALLS),
+  ]);
+
+  if (recentRowsRes.error) {
+    process.stderr.write(`[mansa-mcp] failed to read Supabase stats: ${recentRowsRes.error.message}\n`);
+    return null;
+  }
+
+  const recentRows = recentRowsRes.data || [];
+  const todayRows = recentRows.filter((row) => new Date(row.created_at).getTime() >= today.getTime());
+  const weekRows = recentRows.filter((row) => new Date(row.created_at).getTime() >= new Date(weekIso).getTime());
+  const successfulRows = recentRows.filter((row) => row.status !== "error");
+
+  const hourlyMap = new Map();
+  for (const row of todayRows) {
+    const label = new Date(row.created_at).toISOString().slice(11, 13) + ":00";
+    hourlyMap.set(label, (hourlyMap.get(label) || 0) + 1);
+  }
+
+  const dailyMap = new Map();
+  for (const row of weekRows) {
+    const label = new Date(row.created_at).toISOString().slice(5, 10);
+    dailyMap.set(label, (dailyMap.get(label) || 0) + 1);
+  }
+
+  const allTimeCount = allTimeCountRes.count ?? 0;
+  const errorCount = errorCountRes.count ?? 0;
+
+  return {
+    configured: true,
+    stats: {
+      today: todayCountRes.count ?? 0,
+      week: weekCountRes.count ?? 0,
+      allTime: allTimeCount,
+      avgResponseTimeMs: successfulRows.length
+        ? successfulRows.reduce((sum, row) => sum + (row.response_time_ms || 0), 0) / successfulRows.length
+        : null,
+      errorRate: allTimeCount ? (errorCount / allTimeCount) * 100 : null,
+    },
+    toolCalls: groupCounts(recentRows.map((row) => row.tool_name || "unknown")).slice(0, 10),
+    hourlyTrend: Array.from(hourlyMap.entries()).map(([label, value]) => ({ label, value })),
+    dailyTrend: Array.from(dailyMap.entries()).map(([label, value]) => ({ label, value })),
+    geography: groupCounts(recentRows.map((row) => row.country || "Unknown")).slice(0, 10),
+    userAgents: groupCounts(recentRows.map((row) => row.client || normalizeClient(row.user_agent || ""))).slice(0, 10),
+    recentCalls: recentRows.slice(0, 20).map((row) => ({
+      id: row.id || `${row.tool_name}-${row.created_at}`,
+      tool: row.tool_name || "unknown",
+      params: JSON.stringify(row.params || {}),
+      occurredAt: row.created_at,
+      country: row.country || "Unknown",
+      userAgent: row.user_agent || "Unknown",
+      client: row.client || normalizeClient(row.user_agent || ""),
+      status: row.status || "ok",
+      responseTimeMs: row.response_time_ms || null,
+    })),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function getStatsPayload() {
+  const supabasePayload = await getSupabaseStatsPayload();
+  if (supabasePayload) {
+    return supabasePayload;
+  }
+
   pruneRecentCalls();
 
   const now = Date.now();
@@ -404,7 +541,7 @@ function buildMcpServer(requestMeta = {}) {
         default: throw new Error(`Unknown tool: ${name}`);
       }
       log(name, args, "ok");
-      recordToolCall({
+      await recordToolCall({
         id: `${name}-${Date.now()}`,
         tool: name,
         params: JSON.stringify(args),
@@ -422,7 +559,7 @@ function buildMcpServer(requestMeta = {}) {
       };
     } catch (err) {
       log(name, args, `error: ${err.message}`);
-      recordToolCall({
+      await recordToolCall({
         id: `${name}-${Date.now()}`,
         tool: name,
         params: JSON.stringify(args),
@@ -450,7 +587,11 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/stats", (_req, res) => {
-  res.json(getStatsPayload());
+  getStatsPayload()
+    .then((payload) => res.json(payload))
+    .catch((error) => {
+      res.status(500).json({ error: error instanceof Error ? error.message : "Failed to load stats" });
+    });
 });
 
 app.post("/mcp", async (req, res) => {

@@ -25,6 +25,7 @@
   "dependencies": {
     "@hono/node-server": "^1.19.12",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "@supabase/supabase-js": "^2.99.3",
     "express": "^5.2.1",
     "node-fetch": "^3.3.2"
   },
