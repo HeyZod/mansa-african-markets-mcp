@@ -38,6 +38,10 @@ const MANSA_EXCHANGES = [
   "tanzania", "zambia", "egypt", "morocco", "botswana",
   "mauritius", "zimbabwe", "uganda",
 ];
+const NGX_SYMBOL_ALIASES = {
+  MTN: "MTNN",
+};
+const NGX_SUPABASE_CACHE_TTL = 60_000;
 const TOOL_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
@@ -81,6 +85,8 @@ function getSupabaseClient() {
 
   return supabaseClient;
 }
+
+let ngxSupabaseCache = { data: null, timestamp: 0 };
 
 function loadStatsStore() {
   try {
@@ -400,6 +406,11 @@ function normalizeStockSymbol(value) {
   return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
 }
 
+function normalizeNgxLookupSymbol(value) {
+  const normalized = normalizeStockSymbol(value);
+  return NGX_SYMBOL_ALIASES[normalized] || normalized;
+}
+
 function mapLiveNgxStock(stock) {
   const symbol = String(stock?.symbol || stock?.Symbol || stock?.ticker || "").toUpperCase();
   if (!symbol) return null;
@@ -448,8 +459,73 @@ async function fetchLiveNgxStocksSnapshot() {
   };
 }
 
-function findLiveStockBySymbol(stocks, symbol) {
-  const requested = normalizeStockSymbol(symbol);
+async function fetchLiveNgxSupabaseSnapshot(forceRefresh = false) {
+  const now = Date.now();
+  if (!forceRefresh && ngxSupabaseCache.data && (now - ngxSupabaseCache.timestamp) < NGX_SUPABASE_CACHE_TTL) {
+    return ngxSupabaseCache.data;
+  }
+
+  const client = getSupabaseClient();
+  if (!client) {
+    throw new Error("Supabase client unavailable");
+  }
+
+  const [stocksRes, marketRes] = await Promise.all([
+    client
+      .from("stocks")
+      .select("symbol, full_name, description, current_price, previous_close, change_percent, volume, market_cap, shares_outstanding, sector, market, trade_date, updated_at")
+      .order("symbol", { ascending: true }),
+    client
+      .from("market_stats")
+      .select("asi, pct_change, volume, deals, value, market_cap, advancers, decliners, unchanged, updated_at")
+      .order("id", { ascending: false })
+      .limit(1),
+  ]);
+
+  if (stocksRes.error) {
+    throw new Error(`Supabase NGX stocks error: ${stocksRes.error.message}`);
+  }
+  if (marketRes.error) {
+    throw new Error(`Supabase NGX market error: ${marketRes.error.message}`);
+  }
+
+  const stocks = (stocksRes.data || []).map((stock) => {
+    const price = Number(stock.current_price ?? null);
+    const shares = Number(stock.shares_outstanding ?? null);
+    const computedMarketCap = stock.market_cap !== undefined && stock.market_cap !== null
+      ? Number(stock.market_cap)
+      : (Number.isFinite(price) && Number.isFinite(shares) ? price * shares : null);
+
+    return {
+      symbol: stock.symbol ? String(stock.symbol).toUpperCase() : null,
+      name: stock.full_name || stock.symbol,
+      current_price: Number.isFinite(price) ? price : null,
+      change_percent: Number(stock.change_percent ?? 0) || 0,
+      volume: Number(stock.volume ?? 0) || 0,
+      market_cap: Number.isFinite(computedMarketCap) ? computedMarketCap : null,
+      shares_outstanding: Number.isFinite(shares) ? shares : null,
+      sector: stock.sector || null,
+      market: stock.market || null,
+      trade_date: stock.trade_date || null,
+      updated_at: stock.updated_at || null,
+      description: stock.description || null,
+    };
+  }).filter((stock) => stock.symbol);
+
+  const snapshot = {
+    stocks,
+    total: stocks.length,
+    market: marketRes.data?.[0] || null,
+    source: "Supabase live snapshot",
+    _attribution: NGX_ATTRIBUTION,
+  };
+
+  ngxSupabaseCache = { data: snapshot, timestamp: now };
+  return snapshot;
+}
+
+function findNgxStockBySymbol(stocks, symbol) {
+  const requested = normalizeNgxLookupSymbol(symbol);
   if (!requested) return null;
 
   const exact = stocks.find((stock) => normalizeStockSymbol(stock.symbol) === requested);
@@ -467,31 +543,54 @@ function findLiveStockBySymbol(stocks, symbol) {
 // ─── NGX Pulse handlers ────────────────────────────────────────────────────
 
 async function getNgxMarketOverview() {
-  const json = await ngxFetch("/ngxdata/market");
-  const d = json.data;
-  return { all_share_index: d.asi, change_percent: d.pct_change, market_cap: d.market_cap, volume: d.volume, deals: d.deals, value: d.value, advancers: d.advancers, decliners: d.decliners, unchanged: d.unchanged, updated_at: d.updated_at, _attribution: NGX_ATTRIBUTION };
+  try {
+    const snapshot = await fetchLiveNgxSupabaseSnapshot();
+    const market = snapshot.market || {};
+    return {
+      all_share_index: market.asi,
+      change_percent: market.pct_change,
+      market_cap: market.market_cap,
+      volume: market.volume,
+      deals: market.deals,
+      value: market.value,
+      advancers: market.advancers,
+      decliners: market.decliners,
+      unchanged: market.unchanged,
+      updated_at: market.updated_at,
+      source: snapshot.source,
+      _attribution: snapshot._attribution,
+    };
+  } catch (error) {
+    const json = await ngxFetch("/ngxdata/market");
+    const d = json.data;
+    return { all_share_index: d.asi, change_percent: d.pct_change, market_cap: d.market_cap, volume: d.volume, deals: d.deals, value: d.value, advancers: d.advancers, decliners: d.decliners, unchanged: d.unchanged, updated_at: d.updated_at, _attribution: NGX_ATTRIBUTION };
+  }
 }
 
 async function getNgxStockPrice(symbol) {
   if (!symbol) throw new Error("symbol parameter is required");
-  const liveSnapshot = await fetchLiveNgxStocksSnapshot();
-  const liveStock = findLiveStockBySymbol(liveSnapshot.stocks, symbol);
+  try {
+    const snapshot = await fetchLiveNgxSupabaseSnapshot();
+    const liveStock = findNgxStockBySymbol(snapshot.stocks, symbol);
 
-  if (liveStock) {
-    return {
-      symbol: liveStock.symbol,
-      name: liveStock.name,
-      latest_close: liveStock.current_price,
-      current_price: liveStock.current_price,
-      open_price: null,
-      high_price: null,
-      low_price: null,
-      volume: liveStock.volume,
-      trade_date: liveStock.trade_date,
-      price_history_available: 0,
-      source: liveSnapshot.source,
-      _attribution: liveSnapshot._attribution,
-    };
+    if (liveStock) {
+      return {
+        symbol: liveStock.symbol,
+        name: liveStock.name,
+        latest_close: liveStock.current_price,
+        current_price: liveStock.current_price,
+        open_price: null,
+        high_price: null,
+        low_price: null,
+        volume: liveStock.volume,
+        trade_date: liveStock.trade_date,
+        price_history_available: 0,
+        source: snapshot.source,
+        _attribution: snapshot._attribution,
+      };
+    }
+  } catch (error) {
+    process.stderr.write(`[mansa-mcp] Supabase NGX price lookup failed: ${error.message}\n`);
   }
 
   const json = await ngxFetch(`/ngxdata/prices/${encodeURIComponent(symbol.toUpperCase())}`);
@@ -512,33 +611,56 @@ async function getNgxStockPrice(symbol) {
 }
 
 async function getNgxAllStocks() {
-  const snapshot = await fetchLiveNgxStocksSnapshot();
-  return { total: snapshot.total, stocks: snapshot.stocks, source: snapshot.source, _attribution: snapshot._attribution };
+  try {
+    const snapshot = await fetchLiveNgxSupabaseSnapshot();
+    return { total: snapshot.total, stocks: snapshot.stocks, source: snapshot.source, _attribution: snapshot._attribution };
+  } catch {
+    const json = await ngxFetch("/ngxdata/stocks");
+    return { total: json.total_stocks, stocks: json.stocks, _attribution: NGX_ATTRIBUTION };
+  }
 }
 
 async function getNgxTopGainers(limit = 10) {
-  const snapshot = await fetchLiveNgxStocksSnapshot();
-  const gainers = snapshot.stocks
-    .filter(s => parseFloat(s.change_percent ?? 0) > 0)
-    .sort((a, b) => parseFloat(b.change_percent) - parseFloat(a.change_percent))
-    .slice(0, limit)
-    .map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
-  return { gainers, count: gainers.length, source: snapshot.source, _attribution: snapshot._attribution };
+  try {
+    const snapshot = await fetchLiveNgxSupabaseSnapshot();
+    const gainers = snapshot.stocks
+      .filter(s => parseFloat(s.change_percent ?? 0) > 0)
+      .sort((a, b) => parseFloat(b.change_percent) - parseFloat(a.change_percent))
+      .slice(0, limit)
+      .map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
+    return { gainers, count: gainers.length, source: snapshot.source, _attribution: snapshot._attribution };
+  } catch {
+    const json = await ngxFetch("/ngxdata/stocks");
+    const gainers = (json.stocks ?? []).filter(s => parseFloat(s.change_percent ?? 0) > 0).sort((a, b) => parseFloat(b.change_percent) - parseFloat(a.change_percent)).slice(0, limit).map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
+    return { gainers, count: gainers.length, _attribution: NGX_ATTRIBUTION };
+  }
 }
 
 async function getNgxTopLosers(limit = 10) {
-  const snapshot = await fetchLiveNgxStocksSnapshot();
-  const losers = snapshot.stocks
-    .filter(s => parseFloat(s.change_percent ?? 0) < 0)
-    .sort((a, b) => parseFloat(a.change_percent) - parseFloat(b.change_percent))
-    .slice(0, limit)
-    .map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
-  return { losers, count: losers.length, source: snapshot.source, _attribution: snapshot._attribution };
+  try {
+    const snapshot = await fetchLiveNgxSupabaseSnapshot();
+    const losers = snapshot.stocks
+      .filter(s => parseFloat(s.change_percent ?? 0) < 0)
+      .sort((a, b) => parseFloat(a.change_percent) - parseFloat(b.change_percent))
+      .slice(0, limit)
+      .map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
+    return { losers, count: losers.length, source: snapshot.source, _attribution: snapshot._attribution };
+  } catch {
+    const json = await ngxFetch("/ngxdata/stocks");
+    const losers = (json.stocks ?? []).filter(s => parseFloat(s.change_percent ?? 0) < 0).sort((a, b) => parseFloat(a.change_percent) - parseFloat(b.change_percent)).slice(0, limit).map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
+    return { losers, count: losers.length, _attribution: NGX_ATTRIBUTION };
+  }
 }
 
 async function getNgxMarketStatus() {
-  const json = await ngxFetch("/ngxdata/market-status");
-  return { status: json.data.status, is_open: json.data.is_open, _attribution: NGX_ATTRIBUTION };
+  try {
+    const snapshot = await fetchLiveNgxSupabaseSnapshot();
+    const updatedAt = snapshot.market?.updated_at || null;
+    return { status: updatedAt ? "OPEN" : "UNKNOWN", is_open: Boolean(updatedAt), updated_at: updatedAt, source: snapshot.source, _attribution: snapshot._attribution };
+  } catch {
+    const json = await ngxFetch("/ngxdata/market-status");
+    return { status: json.data.status, is_open: json.data.is_open, _attribution: NGX_ATTRIBUTION };
+  }
 }
 
 async function getNgxDisclosures() {
