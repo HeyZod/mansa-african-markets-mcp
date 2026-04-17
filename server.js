@@ -472,13 +472,15 @@ async function fetchLiveNgxSupabaseSnapshot(forceRefresh = false) {
 
   const [stocksRes, marketRes] = await Promise.all([
     client
-      .from("stocks")
-      .select("symbol, full_name, description, current_price, previous_close, change_percent, volume, market_cap, shares_outstanding, sector, market, trade_date, updated_at")
-      .order("symbol", { ascending: true }),
+      .from("stock_quotes")
+      .select("ticker, name, price, change, change_pct, volume, scraped_at, market_cap, shares_outstanding, sector, market_id")
+      .eq("market_id", "nigeria")
+      .order("ticker", { ascending: true }),
     client
-      .from("market_stats")
-      .select("asi, pct_change, volume, deals, value, market_cap, advancers, decliners, unchanged, updated_at")
-      .order("id", { ascending: false })
+      .from("market_snapshots")
+      .select("market_id, index_name, index_value, index_change, index_change_pct, market_cap, ytd_change, gainers_count, losers_count, stocks_count, scraped_at")
+      .eq("market_id", "nigeria")
+      .order("scraped_at", { ascending: false })
       .limit(1),
   ]);
 
@@ -490,32 +492,46 @@ async function fetchLiveNgxSupabaseSnapshot(forceRefresh = false) {
   }
 
   const stocks = (stocksRes.data || []).map((stock) => {
-    const price = Number(stock.current_price ?? null);
+    const price = Number(stock.price ?? null);
     const shares = Number(stock.shares_outstanding ?? null);
     const computedMarketCap = stock.market_cap !== undefined && stock.market_cap !== null
       ? Number(stock.market_cap)
       : (Number.isFinite(price) && Number.isFinite(shares) ? price * shares : null);
 
     return {
-      symbol: stock.symbol ? String(stock.symbol).toUpperCase() : null,
-      name: stock.full_name || stock.symbol,
+      symbol: stock.ticker ? String(stock.ticker).toUpperCase() : null,
+      name: stock.name || stock.ticker,
       current_price: Number.isFinite(price) ? price : null,
-      change_percent: Number(stock.change_percent ?? 0) || 0,
+      change_percent: Number(stock.change_pct ?? stock.change ?? 0) || 0,
       volume: Number(stock.volume ?? 0) || 0,
       market_cap: Number.isFinite(computedMarketCap) ? computedMarketCap : null,
       shares_outstanding: Number.isFinite(shares) ? shares : null,
       sector: stock.sector || null,
-      market: stock.market || null,
-      trade_date: stock.trade_date || null,
-      updated_at: stock.updated_at || null,
-      description: stock.description || null,
+      market: stock.market_id || "nigeria",
+      trade_date: stock.scraped_at || null,
+      updated_at: stock.scraped_at || null,
+      description: null,
     };
   }).filter((stock) => stock.symbol);
 
+  const market = marketRes.data?.[0] || null;
   const snapshot = {
     stocks,
     total: stocks.length,
-    market: marketRes.data?.[0] || null,
+    market: market ? {
+      asi: market.index_value,
+      pct_change: market.index_change_pct,
+      market_cap: market.market_cap,
+      volume: null,
+      deals: null,
+      value: null,
+      advancers: market.gainers_count,
+      decliners: market.losers_count,
+      unchanged: null,
+      updated_at: market.scraped_at,
+      index_name: market.index_name,
+      ytd_change: market.ytd_change,
+    } : null,
     source: "Supabase live snapshot",
     _attribution: NGX_ATTRIBUTION,
   };
