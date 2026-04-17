@@ -470,25 +470,42 @@ async function fetchLiveNgxSupabaseSnapshot(forceRefresh = false) {
     throw new Error("Supabase client unavailable");
   }
 
-  const [stocksRes, marketRes] = await Promise.all([
+  const [latestQuoteRes, marketRes] = await Promise.all([
     client
       .from("stock_quotes")
-      .select("ticker, name, price, change, change_pct, volume, scraped_at, market_cap, shares_outstanding, sector, market_id")
+      .select("snapshot_id, scraped_at")
       .eq("market_id", "nigeria")
-      .order("ticker", { ascending: true }),
+      .order("snapshot_id", { ascending: false })
+      .limit(1),
     client
       .from("market_snapshots")
-      .select("market_id, index_name, index_value, index_change, index_change_pct, market_cap, ytd_change, gainers_count, losers_count, stocks_count, scraped_at")
+      .select("id, market_id, index_name, index_value, index_change, index_change_pct, market_cap, ytd_change, gainers_count, losers_count, stocks_count, scraped_at")
       .eq("market_id", "nigeria")
       .order("scraped_at", { ascending: false })
       .limit(1),
   ]);
 
-  if (stocksRes.error) {
-    throw new Error(`Supabase NGX stocks error: ${stocksRes.error.message}`);
+  if (latestQuoteRes.error) {
+    throw new Error(`Supabase NGX quote snapshot error: ${latestQuoteRes.error.message}`);
   }
   if (marketRes.error) {
     throw new Error(`Supabase NGX market error: ${marketRes.error.message}`);
+  }
+
+  const latestSnapshotId = latestQuoteRes.data?.[0]?.snapshot_id || null;
+  if (!latestSnapshotId) {
+    throw new Error("Supabase NGX quote snapshot id missing");
+  }
+
+  const stocksRes = await client
+    .from("stock_quotes")
+    .select("ticker, name, price, change, change_pct, volume, scraped_at, market_cap, shares_outstanding, sector, market_id, snapshot_id")
+    .eq("market_id", "nigeria")
+    .eq("snapshot_id", latestSnapshotId)
+    .order("ticker", { ascending: true });
+
+  if (stocksRes.error) {
+    throw new Error(`Supabase NGX stocks error: ${stocksRes.error.message}`);
   }
 
   const stocks = (stocksRes.data || []).map((stock) => {
@@ -519,6 +536,7 @@ async function fetchLiveNgxSupabaseSnapshot(forceRefresh = false) {
     stocks,
     total: stocks.length,
     market: market ? {
+      snapshot_id: market.id,
       asi: market.index_value,
       pct_change: market.index_change_pct,
       market_cap: market.market_cap,
