@@ -396,6 +396,74 @@ async function mansaFetch(path) {
   return res.json();
 }
 
+function normalizeStockSymbol(value) {
+  return String(value || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function mapLiveNgxStock(stock) {
+  const symbol = String(stock?.symbol || stock?.Symbol || stock?.ticker || "").toUpperCase();
+  if (!symbol) return null;
+
+  const currentPrice = Number(
+    stock?.current_price ??
+    stock?.price ??
+    stock?.close_price ??
+    stock?.latest_close ??
+    stock?.ClosePrice ??
+    stock?.PrevClosingPrice ??
+    null
+  );
+
+  return {
+    symbol,
+    name: stock?.name || stock?.full_name || stock?.company_name || stock?.Company2 || symbol,
+    current_price: Number.isFinite(currentPrice) ? currentPrice : null,
+    change_percent: Number(
+      stock?.change_percent ??
+      stock?.change_pct ??
+      stock?.change ??
+      stock?.PercChange ??
+      0
+    ),
+    volume: Number(stock?.volume ?? stock?.Volume ?? 0) || 0,
+    market_cap: stock?.market_cap !== undefined && stock?.market_cap !== null
+      ? Number(stock.market_cap)
+      : null,
+    sector: stock?.sector || stock?.Sector || null,
+    trade_date: stock?.trade_date || stock?.date || stock?.updated_at || stock?.scraped_at || null,
+    updated_at: stock?.updated_at || stock?.scraped_at || null,
+  };
+}
+
+async function fetchLiveNgxStocksSnapshot() {
+  const json = await mansaFetch("/markets/exchanges/nigeria/stocks?limit=500&sort_by=ticker&order=asc");
+  const rawStocks = Array.isArray(json.data) ? json.data : Array.isArray(json.stocks) ? json.stocks : [];
+  const stocks = rawStocks.map(mapLiveNgxStock).filter(Boolean);
+  return {
+    stocks,
+    total: json.meta?.total ?? json.total ?? stocks.length,
+    meta: json.meta || null,
+    source: "Mansa live exchange snapshot",
+    _attribution: MANSA_ATTRIBUTION,
+  };
+}
+
+function findLiveStockBySymbol(stocks, symbol) {
+  const requested = normalizeStockSymbol(symbol);
+  if (!requested) return null;
+
+  const exact = stocks.find((stock) => normalizeStockSymbol(stock.symbol) === requested);
+  if (exact) return exact;
+
+  const nameMatch = stocks.find((stock) => {
+    const normalizedName = normalizeStockSymbol(stock.name);
+    return normalizedName.includes(requested) || requested.includes(normalizedName);
+  });
+  if (nameMatch) return nameMatch;
+
+  return stocks.find((stock) => normalizeStockSymbol(stock.symbol).startsWith(requested));
+}
+
 // ─── NGX Pulse handlers ────────────────────────────────────────────────────
 
 async function getNgxMarketOverview() {
@@ -406,27 +474,66 @@ async function getNgxMarketOverview() {
 
 async function getNgxStockPrice(symbol) {
   if (!symbol) throw new Error("symbol parameter is required");
+  const liveSnapshot = await fetchLiveNgxStocksSnapshot();
+  const liveStock = findLiveStockBySymbol(liveSnapshot.stocks, symbol);
+
+  if (liveStock) {
+    return {
+      symbol: liveStock.symbol,
+      name: liveStock.name,
+      latest_close: liveStock.current_price,
+      current_price: liveStock.current_price,
+      open_price: null,
+      high_price: null,
+      low_price: null,
+      volume: liveStock.volume,
+      trade_date: liveStock.trade_date,
+      price_history_available: 0,
+      source: liveSnapshot.source,
+      _attribution: liveSnapshot._attribution,
+    };
+  }
+
   const json = await ngxFetch(`/ngxdata/prices/${encodeURIComponent(symbol.toUpperCase())}`);
   const prices = json.prices ?? [];
   const latest = prices[prices.length - 1] ?? {};
-  return { symbol: json.symbol, latest_close: latest.close_price, open_price: latest.open_price, high_price: latest.high_price, low_price: latest.low_price, volume: latest.volume, trade_date: latest.trade_date, price_history_available: prices.length, _attribution: NGX_ATTRIBUTION };
+  return {
+    symbol: json.symbol,
+    latest_close: latest.close_price,
+    open_price: latest.open_price,
+    high_price: latest.high_price,
+    low_price: latest.low_price,
+    volume: latest.volume,
+    trade_date: latest.trade_date,
+    price_history_available: prices.length,
+    source: "NGX Pulse historical fallback",
+    _attribution: NGX_ATTRIBUTION
+  };
 }
 
 async function getNgxAllStocks() {
-  const json = await ngxFetch("/ngxdata/stocks");
-  return { total: json.total_stocks, stocks: json.stocks, _attribution: NGX_ATTRIBUTION };
+  const snapshot = await fetchLiveNgxStocksSnapshot();
+  return { total: snapshot.total, stocks: snapshot.stocks, source: snapshot.source, _attribution: snapshot._attribution };
 }
 
 async function getNgxTopGainers(limit = 10) {
-  const json = await ngxFetch("/ngxdata/stocks");
-  const gainers = (json.stocks ?? []).filter(s => parseFloat(s.change_percent ?? 0) > 0).sort((a, b) => parseFloat(b.change_percent) - parseFloat(a.change_percent)).slice(0, limit).map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
-  return { gainers, count: gainers.length, _attribution: NGX_ATTRIBUTION };
+  const snapshot = await fetchLiveNgxStocksSnapshot();
+  const gainers = snapshot.stocks
+    .filter(s => parseFloat(s.change_percent ?? 0) > 0)
+    .sort((a, b) => parseFloat(b.change_percent) - parseFloat(a.change_percent))
+    .slice(0, limit)
+    .map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
+  return { gainers, count: gainers.length, source: snapshot.source, _attribution: snapshot._attribution };
 }
 
 async function getNgxTopLosers(limit = 10) {
-  const json = await ngxFetch("/ngxdata/stocks");
-  const losers = (json.stocks ?? []).filter(s => parseFloat(s.change_percent ?? 0) < 0).sort((a, b) => parseFloat(a.change_percent) - parseFloat(b.change_percent)).slice(0, limit).map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
-  return { losers, count: losers.length, _attribution: NGX_ATTRIBUTION };
+  const snapshot = await fetchLiveNgxStocksSnapshot();
+  const losers = snapshot.stocks
+    .filter(s => parseFloat(s.change_percent ?? 0) < 0)
+    .sort((a, b) => parseFloat(a.change_percent) - parseFloat(b.change_percent))
+    .slice(0, limit)
+    .map(({ symbol, name, current_price, change_percent, volume, sector }) => ({ symbol, name, current_price, change_percent, volume, sector }));
+  return { losers, count: losers.length, source: snapshot.source, _attribution: snapshot._attribution };
 }
 
 async function getNgxMarketStatus() {
