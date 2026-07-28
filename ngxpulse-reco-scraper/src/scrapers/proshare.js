@@ -124,6 +124,45 @@ async function downloadImageBase64(url) {
 
 // ─── Claude extraction ────────────────────────────────────────────────────────
 
+/**
+ * Pulls the complete top-level objects out of a truncated JSON array.
+ * Tracks string state so braces inside company names don't skew the depth count.
+ */
+function salvageObjects(text) {
+  const rows = [];
+  let depth = 0;
+  let start = -1;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === "{") {
+      if (depth === 0) start = i;
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && start >= 0) {
+        try {
+          rows.push(JSON.parse(text.slice(start, i + 1)));
+        } catch {
+          // Incomplete object at the cut — drop it.
+        }
+        start = -1;
+      }
+    }
+  }
+  return rows;
+}
+
 const EXTRACTION_PROMPT = `You are a financial data extraction expert. Extract ALL broker stock recommendations from the inputs below.
 
 You are given:
@@ -182,11 +221,15 @@ async function extractWithClaude(articleText, weekKey, tableImageUrl) {
     userContent.push({ type: "text", text: EXTRACTION_PROMPT + truncated });
   }
 
-  const message = await claude.messages.create({
+  // A full CMO table runs ~300 broker×ticker rows (~17k output tokens), which
+  // overflowed the old 16k cap and truncated the JSON mid-row. Streaming is
+  // required above ~16k max_tokens or the SDK hits its HTTP timeout.
+  const stream = claude.messages.stream({
     model: "claude-sonnet-4-6",
-    max_tokens: 16384,
+    max_tokens: 64000,
     messages: [{ role: "user", content: userContent }],
   });
+  const message = await stream.finalMessage();
 
   if (message.stop_reason === "max_tokens") {
     console.warn("[Claude] Response hit max_tokens — output may be truncated");
@@ -206,8 +249,14 @@ async function extractWithClaude(articleText, weekKey, tableImageUrl) {
   try {
     parsed = JSON.parse(cleaned);
   } catch (e) {
-    console.error("[Claude] JSON parse failed. Raw output:", raw.slice(0, 800));
-    throw new Error(`Claude returned invalid JSON: ${e.message}`);
+    // A truncated array is unparseable as a whole, but the rows before the cut
+    // are intact — keep those rather than losing the entire week.
+    parsed = salvageObjects(cleaned);
+    if (parsed.length === 0) {
+      console.error("[Claude] JSON parse failed. Raw output:", raw.slice(0, 800));
+      throw new Error(`Claude returned invalid JSON: ${e.message}`);
+    }
+    console.warn(`[Claude] Output was malformed/truncated — salvaged ${parsed.length} complete rows`);
   }
 
   if (!Array.isArray(parsed)) {
@@ -248,14 +297,21 @@ export async function scrapeProshare(forDate) {
     try {
       console.log(`[Proshare] Trying ${url}`);
       const fetched = await fetchProshareArticle(url);
-      // A real article has substantive body text; a 404/stub page does not.
-      if ((fetched.articleText || "").length >= 200) {
+      // Before publication Proshare serves a ~1.6k-char stub at the real URL with
+      // no CMO table image. The published article is 10k+ chars and always carries
+      // the table PNG, so reject the stub here rather than paying for an
+      // extraction call that can only return zero rows.
+      const len = (fetched.articleText || "").length;
+      if (len >= 200 && (fetched.tableImageUrl || len >= 3000)) {
         articleText = fetched.articleText;
         tableImageUrl = fetched.tableImageUrl;
         if (tableImageUrl) console.log(`[Proshare] Table image: ${tableImageUrl}`);
         break;
       }
-      lastError = new Error(`Article text suspiciously short (${(fetched.articleText || "").length} chars) at ${url}`);
+      lastError = new Error(
+        `Not the published article at ${url} (${len} chars, ` +
+          `${fetched.tableImageUrl ? "table image present" : "no CMO table image"})`
+      );
       console.warn(`[Proshare] ${lastError.message} — trying next URL form`);
     } catch (err) {
       lastError = err;
